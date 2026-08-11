@@ -44,6 +44,10 @@ import kora_gateway_client  # noqa: E402
 _WS_RECONNECT_MARGIN_SECONDS = 15.0
 _WS_SUBSCRIBE_ACK_TIMEOUT_SECONDS = 10.0
 _WS_RECONNECT_RETRY_DELAY_SECONDS = 5.0
+# Bounds per-market queue growth for a market whose venue-side subscription outlives its local
+# consumer (e.g. unsubscribe_from_trading_pair, which has no wire-level unsubscribe to send) --
+# frames keep arriving at ~1/s with nothing to drain them otherwise, growing the queue forever.
+_MAX_MARKET_QUEUE_SIZE = 50
 
 
 class KoraDataSource:
@@ -93,25 +97,39 @@ class KoraDataSource:
         # per-market (a caller must know the market to ask for its events, same as
         # subscribe_market(market)); orders/trades are single queues since those channels are
         # party-scoped, not market-scoped.
-        self._partial_depth_queues: DefaultDict[str, "asyncio.Queue[dict]"] = defaultdict(asyncio.Queue)
-        self._recent_trade_queues: DefaultDict[str, "asyncio.Queue[dict]"] = defaultdict(asyncio.Queue)
+        self._partial_depth_queues: DefaultDict[str, "asyncio.Queue[dict]"] = defaultdict(
+            lambda: asyncio.Queue(maxsize=_MAX_MARKET_QUEUE_SIZE)
+        )
+        self._recent_trade_queues: DefaultDict[str, "asyncio.Queue[dict]"] = defaultdict(
+            lambda: asyncio.Queue(maxsize=_MAX_MARKET_QUEUE_SIZE)
+        )
         self._order_update_queue: "asyncio.Queue[dict]" = asyncio.Queue()
         self._trade_update_queue: "asyncio.Queue[dict]" = asyncio.Queue()
 
     # -- lifecycle --------------------------------------------------------------------------
 
     async def initialize(self) -> None:
-        await self._auth.start()  # logs in, starts the proactive REST-token refresh loop
+        self._closing = False  # a prior shutdown() may have left this True; this generation is fresh
+        try:
+            await self._auth.start()  # logs in, starts the proactive REST-token refresh loop
 
-        self._gateway_api_client = kora_gateway_client.ApiClient(self._gateway_config)
-        self._trading_api = kora_gateway_client.TradingApi(self._gateway_api_client)
-        self._market_data_api = kora_gateway_client.MarketDataApi(self._gateway_api_client)
-        self._http_session = aiohttp.ClientSession()
+            self._gateway_api_client = kora_gateway_client.ApiClient(self._gateway_config)
+            self._trading_api = kora_gateway_client.TradingApi(self._gateway_api_client)
+            self._market_data_api = kora_gateway_client.MarketDataApi(self._gateway_api_client)
+            self._http_session = aiohttp.ClientSession()
 
-        await self._load_markets()
-        await self._connect_ws()
-        await self.subscribe_private()
-        self._ws_reconnect_task = asyncio.create_task(self._reconnect_before_expiry_loop())
+            await self._load_markets()
+            await self._connect_ws()
+            await self.subscribe_private()
+            self._ws_reconnect_task = asyncio.create_task(self._reconnect_before_expiry_loop())
+        except Exception:
+            # Don't leave a half-constructed session/socket for a retried initialize() to leak
+            # (a fresh ApiClient/ClientSession/WS would just overwrite these references) or for a
+            # later reconnect to find in a subscribed-to-nothing state (_reconnect_ws() resubscribes
+            # only what _subscribed_channels already holds, which a failed subscribe_private()
+            # never populated) -- tear down whatever this attempt built before propagating.
+            await self.shutdown()
+            raise
 
     async def shutdown(self) -> None:
         self._closing = True
@@ -391,12 +409,23 @@ class KoraDataSource:
             self._trade_update_queue.put_nowait(data)
         elif channel.startswith("partialDepth."):
             market = channel[len("partialDepth."):].split("@", 1)[0]
-            self._partial_depth_queues[market].put_nowait(data)
+            self._put_market_frame_nowait(self._partial_depth_queues[market], data)
         elif channel.startswith("recentTrade."):
             market = channel[len("recentTrade."):]
-            self._recent_trade_queues[market].put_nowait(data)
+            self._put_market_frame_nowait(self._recent_trade_queues[market], data)
         else:
             self.logger().debug("kora_spot: unhandled WS channel %s", channel)
+
+    @staticmethod
+    def _put_market_frame_nowait(queue: "asyncio.Queue", data: Dict[str, Any]) -> None:
+        try:
+            queue.put_nowait(data)
+        except asyncio.QueueFull:
+            # Only reachable for a market nothing is draining (e.g. unsubscribed locally but still
+            # live venue-side, per unsubscribe_from_trading_pair's own comment) -- drop the oldest
+            # rather than growing forever; the newest frame matters more than a stale one anyway.
+            queue.get_nowait()
+            queue.put_nowait(data)
 
     # -- WebSocket: event queue getters (CONTRACT.md KoraDataSource surface) -----------------
 

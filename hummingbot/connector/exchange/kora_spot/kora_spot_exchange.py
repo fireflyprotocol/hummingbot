@@ -504,10 +504,20 @@ class KoraSpotExchange(ExchangePyBase):
 
         # Missing from the open-orders list: GetOrder is 501 today (CONTRACT.md), so GetFills is
         # the only remaining REST signal. Ask whether this order produced a settled fill rather
-        # than assuming filled -- it's just as often gone because it was cancelled, expired, or
-        # busted.
+        # than assuming filled -- it's just as often gone because it was cancelled, expired,
+        # rejected, or busted, and REST alone cannot tell those apart once GetFills comes back
+        # empty (unlike the found-in-open-orders branch above, which gets "rejected" -> FAILED
+        # from the order's own status). This can only be resolved once GetOrder stops being 501;
+        # until then, log so a rejected order silently reported as CANCELED here is at least
+        # diagnosable instead of indistinguishable from a real cancel.
         fills = await self._data_source.get_fills(order_id=exchange_order_id)
         was_filled = any(f.settlement_state == kora_gateway_client.SettlementState.SETTLED for f in fills)
+        if not was_filled:
+            self.logger().warning(
+                f"Order {exchange_order_id} disappeared from open orders with no settled fills; "
+                f"reporting CANCELED. GetOrder is 501 today so this cannot distinguish a genuine "
+                f"cancel from a rejection missed on the orders WS channel."
+            )
         return OrderUpdate(
             trading_pair=tracked_order.trading_pair,
             update_timestamp=self._time(),

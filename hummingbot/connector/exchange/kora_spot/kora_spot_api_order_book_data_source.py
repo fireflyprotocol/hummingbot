@@ -87,6 +87,14 @@ class KoraSpotAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # from *either* frame type (depth or trade) can push a fresh REST snapshot onto the same
         # queue the tracker is already draining, without this class owning a second queue.
         self._snapshot_output_queue: Optional["asyncio.Queue"] = None
+        self._trade_output_queue: Optional["asyncio.Queue"] = None
+        # trading_pair -> its per-market listener task. listen_for_order_book_snapshots/
+        # listen_for_trades gather over these at startup, but a pair added later via
+        # subscribe_to_trading_pair (e.g. OrderBookTracker.add_trading_pair) has no other way to
+        # get a listener spun up, and a pair removed via unsubscribe_from_trading_pair has no
+        # other way to get its listener stopped -- both go through these dicts instead.
+        self._depth_listener_tasks: Dict[str, asyncio.Task] = {}
+        self._trade_listener_tasks: Dict[str, asyncio.Task] = {}
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """Dead code by design, mirroring kora_spot_user_stream_data_source.py's identical
@@ -168,6 +176,15 @@ class KoraSpotAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     def _force_resnapshot(self, market: str) -> None:
         if self._snapshot_output_queue is None:
+            # Reachable if the depth listener's task is down/restarting while the trade listener
+            # (which can also observe the epoch bump) is still up -- the warning logged just above
+            # this call already asserted a resnapshot would happen, so say plainly that it didn't
+            # rather than leaving that warning as the only, misleading signal.
+            self.logger().warning(
+                "kora_spot: cannot force a fresh order book snapshot for market %s -- the order"
+                " book snapshot listener isn't running; it will resnapshot on its own restart.",
+                market,
+            )
             return
         asyncio.create_task(self._push_fresh_snapshot(market, self._snapshot_output_queue))
 
@@ -210,11 +227,17 @@ class KoraSpotAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: "asyncio.Queue"):
         self._snapshot_output_queue = output
-        tasks = [self._listen_for_partial_depth(trading_pair, output) for trading_pair in self._trading_pairs]
+        self._depth_listener_tasks = {
+            trading_pair: asyncio.create_task(self._listen_for_partial_depth(trading_pair, output))
+            for trading_pair in self._trading_pairs
+        }
         try:
-            await asyncio.gather(*tasks)
+            await asyncio.gather(*self._depth_listener_tasks.values())
         finally:
             self._snapshot_output_queue = None
+            for task in self._depth_listener_tasks.values():
+                task.cancel()
+            self._depth_listener_tasks = {}
 
     async def _listen_for_partial_depth(self, trading_pair: str, output: "asyncio.Queue"):
         market = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
@@ -253,8 +276,11 @@ class KoraSpotAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if raw_message.get("settlementState") != "settled":
             return
 
-        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=market)
         side = str(raw_message.get("side", "")).upper()
+        if side not in ("BUY", "SELL"):
+            self.logger().warning("kora_spot: recentTrade frame with unrecognised side %r; dropping: %s", side, raw_message)
+            return
+        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=market)
         trade_type = float(TradeType.BUY.value) if side == "BUY" else float(TradeType.SELL.value)
 
         message_queue.put_nowait(
@@ -284,8 +310,18 @@ class KoraSpotAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return self._time()
 
     async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: "asyncio.Queue"):
-        tasks = [self._listen_for_recent_trades(trading_pair, output) for trading_pair in self._trading_pairs]
-        await asyncio.gather(*tasks)
+        self._trade_output_queue = output
+        self._trade_listener_tasks = {
+            trading_pair: asyncio.create_task(self._listen_for_recent_trades(trading_pair, output))
+            for trading_pair in self._trading_pairs
+        }
+        try:
+            await asyncio.gather(*self._trade_listener_tasks.values())
+        finally:
+            self._trade_output_queue = None
+            for task in self._trade_listener_tasks.values():
+                task.cancel()
+            self._trade_listener_tasks = {}
 
     async def _listen_for_recent_trades(self, trading_pair: str, output: "asyncio.Queue"):
         market = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
@@ -304,6 +340,19 @@ class KoraSpotAPIOrderBookDataSource(OrderBookTrackerDataSource):
             market = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
             await self._data_source.subscribe_market(market)
             self.add_trading_pair(trading_pair)
+            # listen_for_order_book_snapshots/listen_for_trades only spin up listener tasks for
+            # the trading_pairs known at their own startup gather() -- a pair added afterward (e.g.
+            # OrderBookTracker.add_trading_pair) needs its own task started here, or the venue can
+            # push frames into KoraDataSource's queues for it forever with nothing ever consuming
+            # them.
+            if self._snapshot_output_queue is not None and trading_pair not in self._depth_listener_tasks:
+                self._depth_listener_tasks[trading_pair] = asyncio.create_task(
+                    self._listen_for_partial_depth(trading_pair, self._snapshot_output_queue)
+                )
+            if self._trade_output_queue is not None and trading_pair not in self._trade_listener_tasks:
+                self._trade_listener_tasks[trading_pair] = asyncio.create_task(
+                    self._listen_for_recent_trades(trading_pair, self._trade_output_queue)
+                )
             return True
         except asyncio.CancelledError:
             raise
@@ -316,14 +365,18 @@ class KoraSpotAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # recentTrade share one subscribe_market() call per market, and the WS protocol doc gives
         # no per-market unsubscribe for it either. Best-effort: call it if a later revision of
         # KoraDataSource adds one, otherwise just drop local bookkeeping — the subscription stays
-        # live venue-side (harmless: unused frames are simply never read off the event queue for
-        # a market this class has stopped tracking).
+        # live venue-side, so KoraDataSource keeps enqueueing frames for it (bounded, see
+        # data_sources/kora_data_source.py's _MAX_MARKET_QUEUE_SIZE) even after the listener tasks
+        # below are cancelled.
         unsubscribe = getattr(self._data_source, "unsubscribe_market", None)
         try:
             if unsubscribe is not None:
                 market = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 await unsubscribe(market)
             self.remove_trading_pair(trading_pair)
+            for task in (self._depth_listener_tasks.pop(trading_pair, None), self._trade_listener_tasks.pop(trading_pair, None)):
+                if task is not None:
+                    task.cancel()
             return True
         except asyncio.CancelledError:
             raise

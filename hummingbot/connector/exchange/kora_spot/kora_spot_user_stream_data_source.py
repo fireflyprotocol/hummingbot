@@ -30,6 +30,7 @@ Notes for the consumer of this queue (this file only forwards, it does not act o
   locally tracked orders is `kora_spot_exchange.py`'s job (it owns `InFlightOrder` bookkeeping).
 """
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from hummingbot.connector.exchange.kora_spot import kora_spot_constants as CONSTANTS
@@ -111,26 +112,28 @@ class KoraSpotUserStreamDataSource(UserStreamTrackerDataSource):
             pending_tasks = []
             try:
                 pending_tasks = [asyncio.create_task(getter()) for getter in event_getters.values()]
-                tags = list(event_getters.keys())
+                task_tags = dict(zip(pending_tasks, event_getters.keys()))
                 done, pending = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
 
                 for task in pending:
                     task.cancel()
 
-                event_type = None
-                data = None
-                for task, tag in zip(pending_tasks, tags):
-                    if task in done and not task.cancelled() and task.exception() is None:
-                        event_type = tag
-                        data = task.result()
-                        break
-
-                if data is None:
-                    continue
-
-                self._last_recv_time = self._current_time()
-                self._check_mkt_epoch(data)
-                output.put_nowait({"_type": event_type, **data})
+                # asyncio.wait can return more than one task in `done` (both queues already had an
+                # item ready, e.g. a fill emitting an orders frame and a trades frame close
+                # together) -- process every one of them, not just the first, or the second's
+                # already-fetched result is silently discarded when pending_tasks is replaced next
+                # iteration.
+                for task in done:
+                    if task.cancelled():
+                        continue
+                    exc = task.exception()
+                    if exc is not None:
+                        self.logger().warning(f"kora_spot: error fetching {task_tags[task]} event: {exc}")
+                        continue
+                    data = task.result()
+                    self._last_recv_time = self._current_time()
+                    self._check_mkt_epoch(data)
+                    output.put_nowait({"_type": task_tags[task], **data})
 
             except asyncio.CancelledError:
                 for task in pending_tasks:
@@ -144,4 +147,7 @@ class KoraSpotUserStreamDataSource(UserStreamTrackerDataSource):
 
     @staticmethod
     def _current_time() -> float:
-        return asyncio.get_event_loop().time()
+        # Wall clock, not the event loop's monotonic clock -- ExchangePyBase._get_poll_interval
+        # compares this against a wall-clock timestamp, and every sibling connector's
+        # last_recv_time (via WSConnection._update_last_recv_time) is wall-clock too.
+        return time.time()
