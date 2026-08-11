@@ -1,11 +1,36 @@
 .ONESHELL:
-.PHONY: test run run_coverage report_coverage development-diff-cover uninstall build install setup deploy down
+.PHONY: test run run_coverage report_coverage development-diff-cover uninstall build install setup deploy down generate-kora-client
 
 DYDX ?= 0
 ENV_FILE := setup/environment.yml
 ifeq ($(DYDX),1)
   ENV_FILE := setup/environment_dydx.yml
 endif
+
+# Path to a local checkout of fireflyprotocol/kora-mono -- the source of both OpenAPI specs
+# below. Override on the command line if it doesn't live next to this repo, e.g.:
+#   make generate-kora-client KORA_MONO_PATH=~/code/kora-mono
+KORA_MONO_PATH ?= ../kora-mono
+
+# Reproduces the two `openapi-generator-cli` invocations already run once by hand to produce
+# hummingbot/connector/exchange/kora_spot/generated/ (see that connector's CONTRACT.md,
+# "Codegen commands already run once"). Re-run whenever gateway-service's or auth-server's spec
+# changes; the generated/ directory is checked in, same as bluefin_pro_sdk's own openapi_client.
+generate-kora-client:
+	@if [ ! -d "$(KORA_MONO_PATH)" ]; then \
+		echo "Error: KORA_MONO_PATH ($(KORA_MONO_PATH)) does not exist. Pass the path to your kora-mono checkout, e.g. make generate-kora-client KORA_MONO_PATH=~/code/kora-mono"; \
+		exit 1; \
+	fi
+	npx --yes @openapitools/openapi-generator-cli generate \
+		-i $(KORA_MONO_PATH)/gateway-service/resources/server/openapi.yaml \
+		-g python -o hummingbot/connector/exchange/kora_spot/generated/kora_gateway_client \
+		--additional-properties packageName=kora_gateway_client,generateSourceCodeOnly=true,library=asyncio \
+		--skip-validate-spec
+	npx --yes @openapitools/openapi-generator-cli generate \
+		-i $(KORA_MONO_PATH)/auth-server/openapi.yml \
+		-g python -o hummingbot/connector/exchange/kora_spot/generated/kora_auth_client \
+		--additional-properties packageName=kora_auth_client,generateSourceCodeOnly=true,library=asyncio \
+		--skip-validate-spec
 
 test:
 	coverage run -m pytest \
