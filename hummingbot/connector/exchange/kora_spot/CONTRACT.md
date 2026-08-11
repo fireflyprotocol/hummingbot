@@ -29,7 +29,7 @@ Two OpenAPI-generator (python, asyncio library) clients live under
 
 Both are constructed the same way:
 ```python
-config = kora_gateway_client.Configuration(host="https://gateway.api.sui-staging.kora.so")
+config = kora_gateway_client.Configuration(host="https://spot.api.staging.kora.so")
 async with kora_gateway_client.ApiClient(config) as api_client:
     trading_api = kora_gateway_client.TradingApi(api_client)
 ```
@@ -125,10 +125,10 @@ def derive_sui_address(public_key_bytes: bytes) -> str:
 From `kora_spot_constants.py` (do not redefine these elsewhere):
 - `EXCHANGE_NAME = "kora_spot"`
 - `DOMAIN = "sui_staging"`
-- `GATEWAY_REST_URL = "https://gateway.api.sui-staging.kora.so"` (placeholder host — confirm
-  against `environment-stack/sui-staging/gateway-service/` if available, else leave as a clearly
-  named placeholder constant `GATEWAY_REST_URL`)
-- `GATEWAY_WS_URL = "wss://gateway.api.sui-staging.kora.so/api/v1/ws"`
+- `GATEWAY_REST_URL = "https://spot.api.staging.kora.so"` (confirmed against
+  `environment-stack/sui-staging/gateway-service/service/terragrunt.hcl`'s ingress block —
+  `gateway.api.sui-staging.kora.so` was an earlier placeholder guess and does not route)
+- `GATEWAY_WS_URL = "wss://spot.api.staging.kora.so/api/v1/ws"`
 - `AUTH_REST_URL = "https://auth.api.staging.kora.so"` (per `docs/taker-guide.md`)
 - `NODE_SERVICE_REST_URL = "https://node.api.staging.kora.so"`
 - `JWT_AUDIENCE = "kora-staging"`

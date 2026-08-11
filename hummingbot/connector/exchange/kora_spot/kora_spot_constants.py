@@ -6,10 +6,12 @@ from hummingbot.core.data_type.in_flight_order import OrderState
 EXCHANGE_NAME = "kora_spot"
 DOMAIN = "sui_staging"
 
-# Placeholder hosts for sui-staging — confirm against environment-stack/sui-staging/*
-# terragrunt.hcl if/when this connector targets another environment.
-GATEWAY_REST_URL = "https://gateway.api.sui-staging.kora.so"
-GATEWAY_WS_URL = "wss://gateway.api.sui-staging.kora.so/api/v1/ws"
+# Confirmed against kora-mono's environment-stack/sui-staging/*/service/terragrunt.hcl
+# ingress blocks (the actual deployed hostnames, not a guess) — gateway-service's public
+# ingress is "spot.api.staging.kora.so", NOT "gateway.api.sui-staging.kora.so"; the latter
+# doesn't route anywhere. Re-check here if this connector ever targets another environment.
+GATEWAY_REST_URL = "https://spot.api.staging.kora.so"
+GATEWAY_WS_URL = "wss://spot.api.staging.kora.so/api/v1/ws"
 AUTH_REST_URL = "https://auth.api.staging.kora.so"
 NODE_SERVICE_REST_URL = "https://node.api.staging.kora.so"
 
