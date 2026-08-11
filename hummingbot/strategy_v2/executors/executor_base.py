@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple, Union
@@ -31,19 +32,23 @@ class ExecutorBase(RunnableBase):
     Base class for all executors. Executors are responsible for executing orders based on the strategy.
     """
 
-    def __init__(self, strategy: StrategyV2Base, connectors: List[str], config: ExecutorConfigBase, update_interval: float = 0.5):
+    def __init__(self, strategy: StrategyV2Base, connectors: List[str], config: ExecutorConfigBase,
+                 update_interval: float = 0.5, max_retries: int = 10):
         """
         Initializes the executor with the given strategy, connectors and update interval.
 
         :param strategy: The strategy to be used by the executor.
         :param connectors: The connectors to be used by the executor.
         :param update_interval: The update interval for the executor.
+        :param max_retries: The maximum number of retries for the executor.
         """
         super().__init__(update_interval)
         self.config = config
         self.close_type: Optional[CloseType] = None
         self.close_timestamp: Optional[float] = None
         self._strategy: StrategyV2Base = strategy
+        self._max_retries = max_retries
+        self._current_retries = 0
         self._held_position_orders = []  # Keep track of orders that become held positions
         self.connectors = {connector_name: connector for connector_name, connector in strategy.connectors.items() if
                            connector_name in connectors}
@@ -182,11 +187,79 @@ class ExecutorBase(RunnableBase):
         """
         pass
 
+    async def control_loop(self):
+        """
+        Override control loop to evaluate max retries after each control task.
+        """
+        await self.on_start()
+        while not self.terminated.is_set():
+            try:
+                await self.control_task()
+                self.evaluate_max_retries()
+            except Exception as e:
+                self.logger().error(e, exc_info=True)
+            finally:
+                await asyncio.sleep(self.update_interval)
+        self.on_stop()
+
     def early_stop(self, keep_position: bool = False):
         """
         This method allows strategy to stop the executor early.
         """
         raise NotImplementedError
+
+    def _collect_held_position_orders(self) -> List[Dict]:
+        """
+        Synchronous snapshot of every fill that still represents exchange exposure.
+
+        Subclasses override this to report their fills from state they already hold —
+        no awaiting, no extra control-loop ticks — so that a forced stop at the
+        shutdown deadline can convert whatever executed into a position hold. The
+        default returns the orders a normal shutdown already accumulated.
+        """
+        return list(self._held_position_orders)
+
+    def _cancel_outstanding_orders(self):
+        """
+        Best-effort cancellation of live orders before a forced stop. Subclasses whose
+        cancellation entry point is not ``cancel_open_orders`` override this.
+        """
+        cancel_open_orders = getattr(self, "cancel_open_orders", None)
+        if callable(cancel_open_orders):
+            cancel_open_orders()
+
+    def force_stop_with_position_hold(self):
+        """
+        Terminate immediately, converting whatever has already executed into a
+        position hold.
+
+        This is the shutdown-deadline fallback. A normal shutdown lets the control
+        loop finish its close/unwind asynchronously; when the orchestrator's budget
+        expires the loop is about to lose its market registrations, so the only safe
+        move is to stop synchronously and hand any residual exposure to the position
+        store for recovery on the next start. Executors with nothing executed are
+        closed as FAILED so the abnormal end stays visible.
+        """
+        try:
+            self._cancel_outstanding_orders()
+        except Exception:
+            # The exposure still has to be persisted and the control loop stopped even
+            # if shutdown has already made strategy-level cancellation unavailable.
+            self.logger().exception("Failed to cancel outstanding orders during forced stop.")
+        held_orders = self._collect_held_position_orders()
+        self._held_position_orders = held_orders
+        self.close_type = CloseType.POSITION_HOLD if held_orders else CloseType.FAILED
+        self.stop()
+
+    def evaluate_max_retries(self):
+        """
+        Evaluates the maximum number of retries to place an order and stops the executor
+        if the maximum number of retries is reached. Subclasses can override this method
+        to customize the behavior.
+        """
+        if self._current_retries > self._max_retries:
+            self.close_type = CloseType.FAILED
+            self.stop()
 
     async def validate_sufficient_balance(self):
         """

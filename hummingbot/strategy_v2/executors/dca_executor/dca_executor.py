@@ -37,7 +37,8 @@ class DCAExecutor(ExecutorBase):
             raise ValueError("Amounts and prices lists must have the same length")
 
         # Initialize super class
-        super().__init__(strategy=strategy, connectors=[config.connector_name], config=config, update_interval=update_interval)
+        super().__init__(strategy=strategy, connectors=[config.connector_name], config=config,
+                         update_interval=update_interval, max_retries=max_retries)
         self.config: DCAExecutorConfig = config
 
         # validate amounts with exchange trading rules
@@ -61,10 +62,6 @@ class DCAExecutor(ExecutorBase):
         # used to track the total amount filled that is updated by the event in case that the InFlightOrder is
         # not available
         self._total_executed_amount_backup: Decimal = Decimal("0")
-
-        # add retries
-        self._current_retries = 0
-        self._max_retries = max_retries
 
     @property
     def active_open_orders(self) -> List[TrackedOrder]:
@@ -273,7 +270,6 @@ class DCAExecutor(ExecutorBase):
             self.control_barriers()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
-        self.evaluate_max_retries()
 
     def control_open_order_process(self):
         """
@@ -305,8 +301,14 @@ class DCAExecutor(ExecutorBase):
         This method is responsible for controlling the active executors
         """
         self.control_stop_loss()
+        if self.status != RunnableStatus.RUNNING:
+            return
         self.control_trailing_stop()
+        if self.status != RunnableStatus.RUNNING:
+            return
         self.control_take_profit()
+        if self.status != RunnableStatus.RUNNING:
+            return
         self.control_time_limit()
 
     def control_time_limit(self):
@@ -373,6 +375,21 @@ class DCAExecutor(ExecutorBase):
         else:
             self.close_type = CloseType.EARLY_STOP
             self.place_close_order_and_cancel_open_orders()
+
+    def _collect_held_position_orders(self) -> List[Dict]:
+        """Snapshot residual exposure for a forced stop at the shutdown deadline.
+
+        Every open- and close-side fill is reported; the position store nets them by
+        side, so a partially-closed DCA resolves to its remaining exposure.
+        """
+        held = list(self._held_position_orders)
+        seen = {order.get("client_order_id") for order in held}
+        for tracked in self._open_orders + self._close_orders:
+            if (tracked.order and tracked.executed_amount_base > Decimal("0")
+                    and tracked.order.client_order_id not in seen):
+                seen.add(tracked.order.client_order_id)
+                held.append(tracked.order.to_json())
+        return held
 
     def place_close_order_and_cancel_open_orders(self, price: Decimal = Decimal("NaN")):
         """
@@ -491,6 +508,7 @@ class DCAExecutor(ExecutorBase):
         if open_order:
             self._failed_orders.append(open_order)
             self._open_orders.remove(open_order)
+            self._current_retries += 1
             self.logger().error(f"Order {event.order_id} failed.")
         close_order = next((order for order in self._close_orders if order.order_id == event.order_id), None)
         if close_order:
@@ -540,4 +558,5 @@ class DCAExecutor(ExecutorBase):
             "max_retries": self._max_retries,
             "level_id": self.config.level_id,
             "order_ids": [order.order_id for order in self._open_orders + self._close_orders],
+            "held_position_orders": self._held_position_orders,
         }

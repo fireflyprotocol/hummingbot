@@ -132,8 +132,8 @@ class BinancePerpetualUserStreamDataSource(UserStreamTrackerDataSource):
                     else:
                         self.logger().error(
                             f"Failed to refresh listen key {self._current_listen_key}. Getting new key...")
-                        raise
-                        # Continue to next iteration which will get a new key
+                        # Raise so the except below resets the key and a new one is obtained next iteration
+                        raise IOError(f"Failed to refresh listen key {self._current_listen_key}")
                 await self._sleep(self.LISTEN_KEY_RETRY_INTERVAL)
             except asyncio.CancelledError:
                 self._current_listen_key = None
@@ -180,7 +180,7 @@ class BinancePerpetualUserStreamDataSource(UserStreamTrackerDataSource):
 
         # Get a websocket assistant and connect it
         ws = await self._get_ws_assistant()
-        url = f"{web_utils.wss_url(CONSTANTS.PRIVATE_WS_ENDPOINT, self._domain)}/{self._current_listen_key}"
+        url = f"{web_utils.wss_url(CONSTANTS.PRIVATE_WS_ENDPOINT, self._domain)}?listenKey={self._current_listen_key}"
 
         self.logger().info(f"Connecting to user stream with listen key {self._current_listen_key}")
         await ws.connect(ws_url=url, ping_timeout=self.HEARTBEAT_TIME_INTERVAL)

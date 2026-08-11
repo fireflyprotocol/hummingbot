@@ -1,10 +1,11 @@
 import asyncio
 import logging
 from decimal import Decimal
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.connector.gateway.gateway_base import GatewayBase
+from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -43,7 +44,7 @@ class OrderExecutor(ExecutorBase):
         :param max_retries: The maximum number of retries for the OrderExecutor, defaults to 10.
         """
         super().__init__(strategy=strategy, config=config, connectors=[config.connector_name],
-                         update_interval=update_interval)
+                         update_interval=update_interval, max_retries=max_retries)
         self.config: OrderExecutorConfig = config
 
         # Order tracking
@@ -51,8 +52,6 @@ class OrderExecutor(ExecutorBase):
         self._failed_orders: list[TrackedOrder] = []
         self._canceled_orders: list[TrackedOrder] = []
         self._partial_filled_orders: list[TrackedOrder] = []
-        self._current_retries = 0
-        self._max_retries = max_retries
 
     @property
     def current_market_price(self) -> Decimal:
@@ -64,6 +63,49 @@ class OrderExecutor(ExecutorBase):
         price_type = PriceType.BestBid if self.config.side == TradeType.BUY else PriceType.BestAsk
         return self.get_price(self.config.connector_name, self.config.trading_pair, price_type=price_type)
 
+    @property
+    def executed_amount_base(self) -> Decimal:
+        """
+        Get the total executed amount in base currency.
+
+        :return: The total executed amount.
+        """
+        total = Decimal("0")
+        if self._order:
+            total += self._order.executed_amount_base
+        total += sum(order.executed_amount_base for order in self._partial_filled_orders)
+        return total
+
+    @property
+    def average_executed_price(self) -> Decimal:
+        """
+        Get the average executed price.
+
+        :return: The average executed price.
+        """
+        total_amount = Decimal("0")
+        total_value = Decimal("0")
+
+        if self._order and self._order.executed_amount_base > Decimal("0"):
+            total_amount += self._order.executed_amount_base
+            total_value += self._order.executed_amount_base * self._order.average_executed_price
+
+        for order in self._partial_filled_orders:
+            if order.executed_amount_base > Decimal("0"):
+                total_amount += order.executed_amount_base
+                total_value += order.executed_amount_base * order.average_executed_price
+
+        return total_value / total_amount if total_amount > Decimal("0") else Decimal("0")
+
+    @property
+    def filled_amount_quote(self) -> Decimal:
+        """
+        Get the filled amount in quote currency.
+
+        :return: The filled amount in quote currency.
+        """
+        return self.executed_amount_base * self.average_executed_price
+
     async def control_task(self):
         """
         Control the order execution process based on the execution strategy.
@@ -72,7 +114,6 @@ class OrderExecutor(ExecutorBase):
             self.control_order()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
-        self.evaluate_max_retries()
 
     def control_order(self):
         """
@@ -109,6 +150,26 @@ class OrderExecutor(ExecutorBase):
         """
         self._status = RunnableStatus.SHUTTING_DOWN
 
+    def _cancel_outstanding_orders(self):
+        self.cancel_order()
+
+    def _collect_held_position_orders(self) -> List[Dict]:
+        """Snapshot residual exposure for a forced stop at the shutdown deadline.
+
+        Same fills control_shutdown_process would retain: the tracked order if
+        filled, plus any partial fills from renewals.
+        """
+        held = list(self._held_position_orders)
+        seen = {order.get("client_order_id") for order in held}
+        candidates = list(self._partial_filled_orders)
+        if self._order and self._order.is_filled:
+            candidates.append(self._order)
+        for tracked in candidates:
+            if tracked.order and tracked.order.client_order_id not in seen:
+                seen.add(tracked.order.client_order_id)
+                held.append(tracked.order.to_json())
+        return held
+
     async def control_shutdown_process(self):
         """
         Control the shutdown process of the executor.
@@ -130,28 +191,35 @@ class OrderExecutor(ExecutorBase):
             self.stop()
         await self._sleep(5.0)
 
-    def evaluate_max_retries(self):
-        """
-        Evaluate if the maximum number of retries has been reached.
-        """
-        if self._current_retries > self._max_retries:
-            self.stop()
-
     def place_open_order(self):
         """
         Place the order based on the execution strategy.
+        Accounts for previously filled amounts so renewals only order the remaining quantity.
         """
+        remaining = self.config.amount - self.executed_amount_base
+        if remaining <= Decimal("0"):
+            self.logger().info(
+                f"Executor {self.config.id}: fully filled ({self.executed_amount_base}/{self.config.amount}). "
+                f"No new order needed."
+            )
+            self._held_position_orders.extend([order.order.to_json() for order in self._partial_filled_orders])
+            self.close_type = CloseType.POSITION_HOLD
+            self.stop()
+            return
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             order_type=self.get_order_type(),
-            amount=self.config.amount,
+            amount=remaining,
             price=self.get_order_price(),
             side=self.config.side,
             position_action=self.config.position_action,
         )
         self._order = TrackedOrder(order_id=order_id)
-        self.logger().debug(f"Executor ID: {self.config.id} - Placing order {order_id}")
+        self.logger().debug(
+            f"Executor ID: {self.config.id} - Placing order {order_id} "
+            f"(remaining: {remaining}, filled: {self.executed_amount_base}/{self.config.amount})"
+        )
 
     def get_order_type(self) -> OrderType:
         """
@@ -280,12 +348,15 @@ class OrderExecutor(ExecutorBase):
         :return: A dictionary containing custom information.
         """
         return {
+            "side": self.config.side,
             "level_id": self.config.level_id,
             "current_retries": self._current_retries,
             "max_retries": self._max_retries,
             "order_id": self._order.order_id if self._order else None,
             "order_last_update": self._order.last_update_timestamp if self._order else None,
             "held_position_orders": self._held_position_orders,
+            "executed_amount_base": self.executed_amount_base,
+            "average_executed_price": self.average_executed_price,
         }
 
     def to_format_status(self, scale=1.0):
@@ -303,6 +374,17 @@ class OrderExecutor(ExecutorBase):
         return lines
 
     async def validate_sufficient_balance(self):
+        connector = self.connectors[self.config.connector_name]
+        # Gateway swap connectors have no order book and are not registered in
+        # AllConnectorSettings, so they carry no CEX fee schema. The BudgetChecker /
+        # OrderCandidate path raises trying to load that schema, so it cannot be used
+        # here. Skip the pre-flight check: Gateway itself rejects an under-funded swap
+        # (EVM reverts on gas estimation before submission, Solana fails the quote/sim),
+        # and the executor surfaces that failure through its normal retry path. This
+        # keeps the OrderExecutor identical across Hummingbot and Hummingbot API without
+        # a per-order network round-trip to price the swap.
+        if isinstance(connector, GatewayBase):
+            return
         price_for_validation = self.get_price_for_balance_validation()
         if self.is_perpetual_connector(self.config.connector_name):
             order_candidate = PerpetualOrderCandidate(
@@ -313,6 +395,7 @@ class OrderExecutor(ExecutorBase):
                 amount=self.config.amount,
                 price=price_for_validation,
                 leverage=Decimal(self.config.leverage),
+                position_close=self.config.position_action == PositionAction.CLOSE,
             )
         else:
             order_candidate = OrderCandidate(
@@ -359,4 +442,9 @@ class OrderExecutor(ExecutorBase):
 
         :return: The cumulative fees in quote currency.
         """
-        return Decimal("0")
+        total = Decimal("0")
+        if self._order:
+            total += self._order.cum_fees_quote
+        for order in self._partial_filled_orders:
+            total += order.cum_fees_quote
+        return total

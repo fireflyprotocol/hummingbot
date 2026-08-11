@@ -1,5 +1,5 @@
 .ONESHELL:
-.PHONY: test run run_coverage report_coverage development-diff-cover uninstall build install setup deploy down generate-kora-client
+.PHONY: test run run_coverage report_coverage development-diff-cover uninstall build install setup deploy down generate-kora-client link-cli
 
 DYDX ?= 0
 ENV_FILE := setup/environment.yml
@@ -37,7 +37,6 @@ test:
  	--ignore="test/mock" \
  	--ignore="test/hummingbot/connector/exchange/ndax/" \
  	--ignore="test/hummingbot/connector/derivative/dydx_v4_perpetual/" \
- 	--ignore="test/hummingbot/remote_iface/" \
  	--ignore="test/connector/utilities/oms_connector/" \
  	--ignore="test/hummingbot/strategy/amm_arb/" \
  	--ignore="test/hummingbot/strategy/cross_exchange_market_making/" \
@@ -86,6 +85,25 @@ install:
 		fi; \
 	fi
 	@conda run -n hummingbot --no-capture-output python setup.py build_ext --inplace
+	@conda run -n hummingbot bash -c 'ln -sf "$(CURDIR)/bin/hbot" "$$CONDA_PREFIX/bin/hbot"'
+	@echo "Done. Run: conda activate hummingbot && hbot --help"
+
+link-cli:
+	@src="$(CURDIR)/bin/hbot-host"; dir="$${HBOT_BIN:-}"; \
+	if [ -z "$$dir" ]; then \
+		for d in /usr/local/bin "$$HOME/.local/bin"; do \
+			if [ -w "$$d" ] || { [ ! -e "$$d" ] && mkdir -p "$$d" 2>/dev/null; }; then dir="$$d"; break; fi; \
+		done; \
+	fi; \
+	if [ -z "$$dir" ]; then \
+		echo "No writable bin dir found (tried /usr/local/bin, ~/.local/bin)."; \
+		echo "Set HBOT_BIN to a writable dir on your PATH and retry, e.g.  make link-cli HBOT_BIN=\$$HOME/.local/bin"; \
+		exit 1; \
+	fi; \
+	mkdir -p "$$dir"; ln -sf "$$src" "$$dir/hbot"; \
+	echo "Linked $$dir/hbot -> bin/hbot-host"; \
+	case ":$$PATH:" in *":$$dir:"*) ;; *) echo "NOTE: add $$dir to your PATH to run 'hbot'." ;; esac; \
+	echo "Now 'hbot <command>' dispatches to your source env or the docker container."
 
 run:
 	conda run -n hummingbot --no-capture-output ./bin/hummingbot_quickstart.py $(ARGS)
@@ -101,7 +119,7 @@ setup:
 	fi
 
 deploy:
-	@set -a; . ./.compose.env 2>/dev/null || true; set +a; \
+	@if [ -f ./.compose.env ]; then set -a; . ./.compose.env; set +a; fi; \
 	docker compose up -d
 
 down:

@@ -271,22 +271,40 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
                             "Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...")
         )
 
-    async def test_subscribe_to_channels_raises_cancel_exception(self):
+    async def test_subscribe_public_channels_raises_cancel_exception(self):
         mock_ws = MagicMock()
         mock_ws.send.side_effect = asyncio.CancelledError
 
         with self.assertRaises(asyncio.CancelledError):
-            await self.data_source._subscribe_channels(mock_ws)
+            await self.data_source._subscribe_public_channels(mock_ws)
 
-    async def test_subscribe_to_channels_raises_exception_and_logs_error(self):
+    async def test_subscribe_public_channels_raises_exception_and_logs_error(self):
         mock_ws = MagicMock()
         mock_ws.send.side_effect = Exception("Test Error")
 
         with self.assertRaises(Exception):
-            await self.data_source._subscribe_channels(mock_ws)
+            await self.data_source._subscribe_public_channels(mock_ws)
 
         self.assertTrue(
-            self._is_logged("ERROR", "Unexpected error occurred subscribing to order book trading and delta streams...")
+            self._is_logged("ERROR", "Unexpected error occurred subscribing to order book streams...")
+        )
+
+    async def test_subscribe_market_channels_raises_cancel_exception(self):
+        mock_ws = MagicMock()
+        mock_ws.send.side_effect = asyncio.CancelledError
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.data_source._subscribe_market_channels(mock_ws)
+
+    async def test_subscribe_market_channels_raises_exception_and_logs_error(self):
+        mock_ws = MagicMock()
+        mock_ws.send.side_effect = Exception("Test Error")
+
+        with self.assertRaises(Exception):
+            await self.data_source._subscribe_market_channels(mock_ws)
+
+        self.assertTrue(
+            self._is_logged("ERROR", "Unexpected error occurred subscribing to market streams...")
         )
 
     async def test_channel_originating_message_returns_correct(self):
@@ -307,9 +325,12 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
         msg_queue_diffs: asyncio.Queue = asyncio.Queue()
         msg_queue_trades: asyncio.Queue = asyncio.Queue()
         msg_queue_funding: asyncio.Queue = asyncio.Queue()
+
+        # Both public and market WS connections use the same mock
         mock_ws.return_value = self.mocking_assistant.create_websocket_mock()
         mock_ws.close.return_value = None
 
+        # Feed messages through the mocked websocket (both connections share same mock)
         self.mocking_assistant.add_websocket_aiohttp_message(
             mock_ws.return_value, json.dumps(self._orderbook_update_event())
         )
@@ -347,6 +368,83 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
         self.assertEqual(self.trading_pair, result.content["trading_pair"])
 
         await self.mocking_assistant.run_until_all_aiohttp_messages_delivered(mock_ws.return_value)
+
+    async def test_parse_order_book_diff_message_includes_first_update_id(self):
+        diff_queue: asyncio.Queue = asyncio.Queue()
+
+        await self.data_source._parse_order_book_diff_message(
+            raw_message=self._orderbook_update_event(), message_queue=diff_queue)
+
+        result: OrderBookMessage = diff_queue.get_nowait()
+        self.assertEqual(OrderBookMessageType.DIFF, result.type)
+        self.assertEqual(752409360466, result.update_id)
+        self.assertEqual(752409354963, result.first_update_id)
+        self.assertEqual(self.trading_pair, result.content["trading_pair"])
+        # The last applied `u` is tracked to validate the next diff's `pu`.
+        self.assertEqual(752409360466, self.data_source._last_update_id[self.trading_pair])
+
+    async def test_parse_order_book_diff_message_sequence_gap_forces_resync(self):
+        diff_queue: asyncio.Queue = asyncio.Queue()
+
+        # First diff establishes the sequence (the `pu` chain is not validated on the first event).
+        await self.data_source._parse_order_book_diff_message(
+            raw_message=self._orderbook_update_event(), message_queue=diff_queue)
+        self.assertEqual(1, diff_queue.qsize())
+        last_u = self.data_source._last_update_id[self.trading_pair]
+
+        # Second diff whose `pu` does not chain to the previous `u` -> sequence gap.
+        gapped = self._orderbook_update_event()
+        gapped["data"]["U"] = last_u + 100
+        gapped["data"]["u"] = last_u + 200
+        gapped["data"]["pu"] = last_u + 50
+
+        await self.data_source._parse_order_book_diff_message(raw_message=gapped, message_queue=diff_queue)
+
+        # The gapped diff is not forwarded to the diff stream.
+        self.assertEqual(1, diff_queue.qsize())
+        # A resync request for the pair is queued on the snapshot channel.
+        snapshot_requests = self.data_source._message_queue[self.data_source._snapshot_messages_queue_key]
+        self.assertEqual(1, snapshot_requests.qsize())
+        self.assertEqual(self.trading_pair, snapshot_requests.get_nowait())
+        # The stale tracking is cleared so the post-snapshot diff is not falsely flagged.
+        self.assertNotIn(self.trading_pair, self.data_source._last_update_id)
+        self.assertTrue(
+            self._is_logged(
+                "WARNING",
+                f"Order book diff sequence gap for {self.trading_pair} "
+                f"(expected pu={last_u}, got pu={last_u + 50}). Forcing a snapshot resync.",
+            )
+        )
+
+    @aioresponses()
+    async def test_listen_for_order_book_snapshots_serves_on_demand_resync_request(self, mock_api):
+        url = web_utils.public_rest_url(CONSTANTS.SNAPSHOT_REST_URL, domain=self.domain)
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        mock_response = {
+            "lastUpdateId": 1027024,
+            "E": 1589436922972,
+            "T": 1589436922959,
+            "bids": [["10", "1"]],
+            "asks": [["11", "1"]],
+        }
+        mock_api.get(regex_url, body=json.dumps(mock_response), repeat=True)
+
+        # Queue an on-demand resync request (as the diff parser does on a gap) before starting the loop.
+        self.data_source._message_queue[self.data_source._snapshot_messages_queue_key].put_nowait(self.trading_pair)
+
+        msg_queue: asyncio.Queue = asyncio.Queue()
+        self.listening_task = self.local_event_loop.create_task(
+            self.data_source.listen_for_order_book_snapshots(self.local_event_loop, msg_queue)
+        )
+
+        # First snapshot comes from the initial hourly reset, the second from the on-demand resync request.
+        hourly_reset = await msg_queue.get()
+        on_demand = await msg_queue.get()
+
+        for snapshot in (hourly_reset, on_demand):
+            self.assertEqual(OrderBookMessageType.SNAPSHOT, snapshot.type)
+            self.assertEqual(self.trading_pair, snapshot.content["trading_pair"])
+            self.assertEqual(1027024, snapshot.update_id)
 
     @aioresponses()
     async def test_listen_for_order_book_snapshots_cancelled_error_raised(self, mock_api):
@@ -432,15 +530,19 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
             bidict({self.ex_trading_pair: self.trading_pair, ex_new_pair: new_pair})
         )
 
-        # Create a mock WebSocket assistant
+        # Create mock WebSocket assistants for both public and market connections
         mock_ws = AsyncMock()
+        mock_market_ws = AsyncMock()
         self.data_source._ws_assistant = mock_ws
+        self.data_source._market_ws_assistant = mock_market_ws
 
         result = await self.data_source.subscribe_to_trading_pair(new_pair)
 
         self.assertTrue(result)
-        # Binance perpetual subscribes to 3 channels: depth, aggTrade, markPrice
-        self.assertEqual(3, mock_ws.send.call_count)
+        # 1 send to public WS (@depth)
+        self.assertEqual(1, mock_ws.send.call_count)
+        # 2 sends to market WS (@aggTrade, @markPrice)
+        self.assertEqual(2, mock_market_ws.send.call_count)
 
         # Verify pair was added to trading pairs
         self.assertIn(new_pair, self.data_source._trading_pairs)
@@ -455,6 +557,21 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
 
         # Ensure ws_assistant is None
         self.data_source._ws_assistant = None
+        self.data_source._market_ws_assistant = None
+
+        result = await self.data_source.subscribe_to_trading_pair(new_pair)
+
+        self.assertFalse(result)
+        self.assertTrue(
+            self._is_logged("WARNING", f"Cannot subscribe to {new_pair}: WebSocket not connected")
+        )
+
+    async def test_subscribe_to_trading_pair_market_ws_not_connected(self):
+        """Test subscription fails when market WebSocket is not connected."""
+        new_pair = "ETH-USDT"
+
+        self.data_source._ws_assistant = AsyncMock()
+        self.data_source._market_ws_assistant = None
 
         result = await self.data_source.subscribe_to_trading_pair(new_pair)
 
@@ -475,6 +592,7 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
         mock_ws = AsyncMock()
         mock_ws.send.side_effect = asyncio.CancelledError
         self.data_source._ws_assistant = mock_ws
+        self.data_source._market_ws_assistant = AsyncMock()
 
         with self.assertRaises(asyncio.CancelledError):
             await self.data_source.subscribe_to_trading_pair(new_pair)
@@ -491,6 +609,7 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
         mock_ws = AsyncMock()
         mock_ws.send.side_effect = Exception("Test Error")
         self.data_source._ws_assistant = mock_ws
+        self.data_source._market_ws_assistant = AsyncMock()
 
         result = await self.data_source.subscribe_to_trading_pair(new_pair)
 
@@ -505,13 +624,17 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
         self.assertIn(self.trading_pair, self.data_source._trading_pairs)
 
         mock_ws = AsyncMock()
+        mock_market_ws = AsyncMock()
         self.data_source._ws_assistant = mock_ws
+        self.data_source._market_ws_assistant = mock_market_ws
 
         result = await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
 
         self.assertTrue(result)
-        # Binance perpetual sends 1 unsubscribe message for all channels
+        # 1 unsubscribe to public WS (@depth)
         self.assertEqual(1, mock_ws.send.call_count)
+        # 1 unsubscribe to market WS (@aggTrade + @markPrice in one message)
+        self.assertEqual(1, mock_market_ws.send.call_count)
 
         # Verify pair was removed from trading pairs
         self.assertNotIn(self.trading_pair, self.data_source._trading_pairs)
@@ -523,6 +646,7 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
     async def test_unsubscribe_from_trading_pair_websocket_not_connected(self):
         """Test unsubscription fails when WebSocket is not connected."""
         self.data_source._ws_assistant = None
+        self.data_source._market_ws_assistant = None
 
         result = await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
 
@@ -536,6 +660,7 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
         mock_ws = AsyncMock()
         mock_ws.send.side_effect = asyncio.CancelledError
         self.data_source._ws_assistant = mock_ws
+        self.data_source._market_ws_assistant = AsyncMock()
 
         with self.assertRaises(asyncio.CancelledError):
             await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
@@ -545,6 +670,7 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
         mock_ws = AsyncMock()
         mock_ws.send.side_effect = Exception("Test Error")
         self.data_source._ws_assistant = mock_ws
+        self.data_source._market_ws_assistant = AsyncMock()
 
         result = await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
 
@@ -552,3 +678,17 @@ class BinancePerpetualAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTest
         self.assertTrue(
             self._is_logged("ERROR", f"Error unsubscribing from {self.trading_pair}")
         )
+
+    async def test_connected_websocket_assistant_uses_public_endpoint(self):
+        """Test that the public WS connects to the /public endpoint."""
+        expected_url = web_utils.wss_url(CONSTANTS.PUBLIC_WS_ENDPOINT, self.domain)
+        self.assertIn("public/stream", expected_url)
+
+    async def test_connected_market_websocket_assistant_uses_market_endpoint(self):
+        """Test that the market WS connects to the /market endpoint."""
+        expected_url = web_utils.wss_url(CONSTANTS.MARKET_WS_ENDPOINT, self.domain)
+        self.assertIn("market", expected_url)
+
+    async def test_market_ws_assistant_initialized_to_none(self):
+        """Test that the market WS assistant is initialized to None."""
+        self.assertIsNone(self.data_source._market_ws_assistant)

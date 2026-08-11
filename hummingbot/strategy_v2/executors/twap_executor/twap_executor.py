@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from decimal import Decimal
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import PositionAction, PriceType, TradeType
@@ -32,7 +32,8 @@ class TWAPExecutor(ExecutorBase):
 
     def __init__(self, strategy: StrategyV2Base, config: TWAPExecutorConfig, update_interval: float = 1.0,
                  max_retries: int = 15):
-        super().__init__(strategy=strategy, connectors=[config.connector_name], config=config, update_interval=update_interval)
+        super().__init__(strategy=strategy, connectors=[config.connector_name], config=config,
+                         update_interval=update_interval, max_retries=max_retries)
         self.config = config
         trading_rules = self.get_trading_rules(config.connector_name, config.trading_pair)
         if self.config.order_amount_quote < trading_rules.min_order_size:
@@ -41,8 +42,6 @@ class TWAPExecutor(ExecutorBase):
                                 f"amount {self.config.order_amount_quote} is less than the minimum order {trading_rules.min_order_size}")
         if self.config.is_maker:
             self.logger().warning("Maker mode is in beta. Please use with caution.")
-        self._max_retries = max_retries
-        self._current_retries = 0
         self._start_timestamp = self._strategy.current_timestamp
         self._order_plan: Dict[float, Optional[TrackedOrder]] = self.create_order_plan()
         self._failed_orders = []
@@ -93,7 +92,6 @@ class TWAPExecutor(ExecutorBase):
             self.evaluate_create_order()
             self.evaluate_refresh_orders()
             self.evaluate_all_orders_completed()
-            self.evaluate_max_retries()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.evaluate_all_orders_closed()
 
@@ -214,10 +212,27 @@ class TWAPExecutor(ExecutorBase):
                 self._strategy.cancel(self.config.connector_name, self.config.trading_pair, order.order_id)
 
     def early_stop(self, keep_position: bool = False):
-        self.close_execution_by(CloseType.EARLY_STOP)
+        self.close_type = CloseType.POSITION_HOLD if keep_position else CloseType.EARLY_STOP
+        self.close_timestamp = self._strategy.current_timestamp
         self.cancel_open_orders()
         self._status = RunnableStatus.SHUTTING_DOWN
         self.logger().info("Executor stopped early.")
+
+    def _collect_held_position_orders(self) -> List[Dict]:
+        """Snapshot residual exposure for a forced stop at the shutdown deadline.
+
+        Every tracked order with an executed amount — planned, refreshed, or failed —
+        still represents exposure on the exchange.
+        """
+        held = list(self._held_position_orders)
+        seen = {order.get("client_order_id") for order in held}
+        candidates = list(self._order_plan.values()) + self._refreshed_orders + self._failed_orders
+        for tracked in candidates:
+            if (tracked and tracked.order and tracked.executed_amount_base > Decimal("0")
+                    and tracked.order.client_order_id not in seen):
+                seen.add(tracked.order.client_order_id)
+                held.append(tracked.order.to_json())
+        return held
 
     @property
     def filled_amount_quote(self) -> Decimal:
@@ -286,3 +301,15 @@ class TWAPExecutor(ExecutorBase):
         Get the total executed amount of the orders in quote asset.
         """
         return self.get_total_executed_amount() * self.get_average_executed_price()
+
+    def get_custom_info(self) -> Dict:
+        return {
+            "side": self.config.side,
+            "current_position_average_price": self.get_average_executed_price(),
+            "filled_amount_base": self.get_total_executed_amount(),
+            "filled_amount_quote": self.get_total_executed_amount_quote(),
+            "current_retries": self._current_retries,
+            "max_retries": self._max_retries,
+            "order_ids": [order.order_id for order in self._order_plan.values() if order],
+            "held_position_orders": self._held_position_orders,
+        }
